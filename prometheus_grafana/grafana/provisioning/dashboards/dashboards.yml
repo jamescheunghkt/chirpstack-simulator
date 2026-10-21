@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: chirpstack-simulator
+    orgId: 1
+    folder: ChirpStack Simulator
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards

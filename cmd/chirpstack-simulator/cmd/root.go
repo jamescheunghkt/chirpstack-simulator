@@ -76,4 +76,6 @@ func initConfig() {
 	if err := viper.Unmarshal(&config.C); err != nil {
 		log.WithError(err).Fatal("unmarshal config error")
 	}
+
+	config.C.ApplyDefaults()
 }

@@ -29,6 +29,8 @@ import (
 
 // Start starts the simulator.
 func Start(ctx context.Context, wg *sync.WaitGroup, c config.Config) error {
+	c.ApplyDefaults()
+
 	for i, c := range c.Simulator {
 		log.WithFields(log.Fields{
 			"i": i,
@@ -53,12 +55,15 @@ func Start(ctx context.Context, wg *sync.WaitGroup, c config.Config) error {
 			frequency:            c.Device.Frequency,
 			bandwidth:            c.Device.Bandwidth,
 			spreadingFactor:      c.Device.SpreadingFactor,
+			deviceRegion:         c.Device.Region,
 			duration:             c.Duration,
 			gatewayMinCount:      c.Gateway.MinCount,
 			gatewayMaxCount:      c.Gateway.MaxCount,
 			deviceAppKeys:        make(map[lorawan.EUI64]lorawan.AES128Key),
 			eventTopicTemplate:   c.Gateway.EventTopicTemplate,
 			commandTopicTemplate: c.Gateway.CommandTopicTemplate,
+			statsEnabled:         c.Gateway.StatsEnabled != nil && *c.Gateway.StatsEnabled,
+			statsInterval:        c.Gateway.StatsInterval,
 		}
 
 		go sim.start()
@@ -83,9 +88,14 @@ type simulation struct {
 	frequency       int
 	bandwidth       int
 	spreadingFactor int
+	deviceRegion    string
+
+	statsEnabled  bool
+	statsInterval time.Duration
 
 	tenant               *api.Tenant
 	deviceProfileID      uuid.UUID
+	region               common.Region
 	applicationID        string
 	gatewayIDs           []lorawan.EUI64
 	deviceAppKeysMutex   sync.Mutex
@@ -95,6 +105,26 @@ type simulation struct {
 }
 
 func (s *simulation) start() {
+	region, err := deviceProfileRegion(s.deviceRegion)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"region":    s.deviceRegion,
+			"frequency": s.frequency,
+		}).Error("simulator: invalid device-profile region")
+		s.wg.Done()
+		return
+	}
+	s.region = region
+
+	log.WithFields(log.Fields{
+		"region":                 region.String(),
+		"frequency_hz":           s.frequency,
+		"event_topic_template":   s.eventTopicTemplate,
+		"command_topic_template": s.commandTopicTemplate,
+		"gateway_stats_enabled":  s.statsEnabled,
+		"gateway_stats_interval": s.statsInterval,
+	}).Info("simulator: effective configuration")
+
 	if err := s.init(); err != nil {
 		log.WithError(err).Error("simulator: init simulation error")
 	}
@@ -172,7 +202,11 @@ func (s *simulation) tearDown() error {
 
 func (s *simulation) runSimulation() error {
 	var gateways []*simulator.Gateway
-	var devices []*simulator.Device
+	defer func() {
+		for _, gw := range gateways {
+			gw.StopStats()
+		}
+	}()
 
 	for _, gatewayID := range s.gatewayIDs {
 		gw, err := simulator.NewGateway(
@@ -185,8 +219,21 @@ func (s *simulation) runSimulation() error {
 			return errors.Wrap(err, "new gateway error")
 		}
 		gateways = append(gateways, gw)
+
+		// Stats are independent of device joins so a gateway can be marked
+		// seen while OTAA is still being debugged.
+		if s.statsEnabled {
+			gw.StartStats(s.statsInterval)
+		}
 	}
 
+	if !s.statsEnabled {
+		log.WithFields(log.Fields{
+			"event_topic_template": s.eventTopicTemplate,
+		}).Info("simulator: gateway stats disabled")
+	}
+
+	var devices []*simulator.Device
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(s.ctx)
 	if s.duration != 0 {
@@ -277,18 +324,27 @@ func (s *simulation) setupGateways() error {
 			return errors.Wrap(err, "read random bytes error")
 		}
 
+		statsIntervalSecs := durationSeconds(s.statsInterval, 30)
+		gateway := &api.Gateway{
+			GatewayId:   gatewayID.String(),
+			Name:        gatewayID.String(),
+			Description: gatewayID.String(),
+			TenantId:    s.tenant.GetId(),
+			Location:    &common.Location{},
+		}
+		setGatewayStatsInterval(gateway, statsIntervalSecs)
+
 		_, err := as.Gateway().Create(context.Background(), &api.CreateGatewayRequest{
-			Gateway: &api.Gateway{
-				GatewayId:   gatewayID.String(),
-				Name:        gatewayID.String(),
-				Description: gatewayID.String(),
-				TenantId:    s.tenant.GetId(),
-				Location:    &common.Location{},
-			},
+			Gateway: gateway,
 		})
 		if err != nil {
 			return errors.Wrap(err, "create gateway error")
 		}
+
+		log.WithFields(log.Fields{
+			"gateway_id":          gatewayID,
+			"stats_interval_secs": statsIntervalSecs,
+		}).Info("simulator: created gateway")
 
 		s.gatewayIDs = append(s.gatewayIDs, gatewayID)
 	}
@@ -312,20 +368,25 @@ func (s *simulation) tearDownGateways() error {
 }
 
 func (s *simulation) setupDeviceProfile() error {
-	log.Info("simulator: creating device-profile")
+	region, err := deviceProfileRegion(s.deviceRegion)
+	if err != nil {
+		return err
+	}
+	s.region = region
+
+	log.WithFields(log.Fields{
+		"region":       region.String(),
+		"frequency_hz": s.frequency,
+	}).Info("simulator: creating device-profile")
 
 	dpName, _ := uuid.NewV4()
+	// Each run creates a new profile. A profile left behind by an earlier
+	// process is not updated or deleted here.
+	uplinkIntervalSecs := durationSeconds(s.uplinkInterval, 300)
+	profile := newDeviceProfile(s.tenant.GetId(), dpName.String(), region, uplinkIntervalSecs)
 
 	resp, err := as.DeviceProfile().Create(context.Background(), &api.CreateDeviceProfileRequest{
-		DeviceProfile: &api.DeviceProfile{
-			Name:              dpName.String(),
-			TenantId:          s.tenant.GetId(),
-			MacVersion:        common.MacVersion_LORAWAN_1_0_3,
-			RegParamsRevision: common.RegParamsRevision_B,
-			SupportsOtaa:      true,
-			Region:            common.Region_EU868,
-			AdrAlgorithmId:    "default",
-		},
+		DeviceProfile: profile,
 	})
 	if err != nil {
 		return errors.Wrap(err, "create device-profile error")
@@ -336,6 +397,16 @@ func (s *simulation) setupDeviceProfile() error {
 		return err
 	}
 	s.deviceProfileID = dpID
+
+	log.WithFields(log.Fields{
+		"device_profile_id":    resp.Id,
+		"region":               profile.Region.String(),
+		"mac_version":          profile.MacVersion.String(),
+		"reg_params_revision":  profile.RegParamsRevision.String(),
+		"frequency_hz":         s.frequency,
+		"uplink_interval_secs": profile.UplinkInterval,
+		"event_topic_template": s.eventTopicTemplate,
+	}).Info("simulator: created device-profile")
 
 	return nil
 }
@@ -417,7 +488,7 @@ func (s *simulation) setupDevices() error {
 				},
 			})
 			if err != nil {
-				log.Fatal("create device error, error: %s", err)
+				log.Fatalf("create device error, error: %s", err)
 			}
 
 			_, err = as.Device().CreateKeys(context.Background(), &api.CreateDeviceKeysRequest{
@@ -430,7 +501,7 @@ func (s *simulation) setupDevices() error {
 				},
 			})
 			if err != nil {
-				log.Fatal("create device keys error, error: %s", err)
+				log.Fatalf("create device keys error, error: %s", err)
 			}
 
 			s.deviceAppKeysMutex.Lock()

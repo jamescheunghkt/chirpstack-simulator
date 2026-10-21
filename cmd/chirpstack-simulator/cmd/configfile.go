@@ -112,7 +112,7 @@ const configTemplate = `[general]
 #   payload="010203"
 #
 #   # Frequency (Hz).
-#   frequency=868100000
+#   frequency=923200000
 #
 #   # Bandwidth (Hz).
 #   bandwidth=125000
@@ -120,23 +120,30 @@ const configTemplate = `[general]
 #   # Spreading-factor.
 #   spreading_factor=7
 #
+#   # Device-profile region (ChirpStack common.Region name, not the MQTT prefix).
+#   region="AS923"
+#
 #   # Gateway configuration.
 #   [simulator.gateway]
 #
 #   # Event topic template.
-#   event_topic_template="eu868/{{ "gateway/{{ .GatewayID }}/event/{{ .Event }}" }}"
+#   event_topic_template="as923/{{ "gateway/{{ .GatewayID }}/event/{{ .Event }}" }}"
 #
 #   # Command topic template.
-#   command_topic_template="eu868/{{ "gateway/{{ .GatewayID }}/command/{{ .Command }}" }}"
+#   command_topic_template="as923/{{ "gateway/{{ .GatewayID }}/command/{{ .Command }}" }}"
 #
 #   # Min number of receiving gateways.
 #   min_count=3
 #
 #   # Max number of receiving gateways.
 #   max_count=5
+#
+#   # Gateway stats. Omitted stats_enabled defaults to true. 0s uses 30s.
+#   stats_enabled=true
+#   stats_interval="30s"
 {{ range $index, $element := .Simulator }}
 [[simulator]]
-service_profile_id="{{ $element.ServiceProfileID }}"
+tenant_id="{{ $element.TenantID }}"
 duration="{{ $element.Duration }}"
 activation_time="{{ $element.ActivationTime }}"
 
@@ -148,12 +155,15 @@ activation_time="{{ $element.ActivationTime }}"
   frequency={{ $element.Device.Frequency }}
   bandwidth={{ $element.Device.Bandwidth }}
   spreading_factor={{ $element.Device.SpreadingFactor }}
+  region="{{ $element.Device.Region }}"
 
   [simulator.gateway]
   min_count={{ $element.Gateway.MinCount }}
   max_count={{ $element.Gateway.MaxCount }}
   event_topic_template="{{ $element.Gateway.EventTopicTemplate }}"
   command_topic_template="{{ $element.Gateway.CommandTopicTemplate }}"
+  stats_interval="{{ $element.Gateway.StatsInterval }}"
+  stats_enabled={{ boolPtr $element.Gateway.StatsEnabled }}
 {{ end }}
 
 # Prometheus metrics configuration.
@@ -177,7 +187,14 @@ var configCmd = &cobra.Command{
 	Use:   "configfile",
 	Short: "Print the ChirpStack Network Server configuration file",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		t := template.Must(template.New("config").Parse(configTemplate))
+		t := template.Must(template.New("config").Funcs(template.FuncMap{
+			"boolPtr": func(v *bool) bool {
+				if v == nil {
+					return true
+				}
+				return *v
+			},
+		}).Parse(configTemplate))
 		err := t.Execute(os.Stdout, &config.C)
 		if err != nil {
 			return errors.Wrap(err, "execute config template error")

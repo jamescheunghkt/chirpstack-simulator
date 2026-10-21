@@ -52,13 +52,19 @@ type Config struct {
 			Frequency       int           `mapstructure:"frequency"`
 			Bandwidth       int           `mapstructure:"bandwidth"`
 			SpreadingFactor int           `mapstructure:"spreading_factor"`
+			// Region is the ChirpStack common.Region name stored on the
+			// device profile (for example AS923). It is not the MQTT region id.
+			Region string `mapstructure:"region"`
 		} `mapstructure:"device"`
 
 		Gateway struct {
-			MinCount             int    `mapstructure:"min_count"`
-			MaxCount             int    `mapstructure:"max_count"`
-			EventTopicTemplate   string `mapstructure:"event_topic_template"`
-			CommandTopicTemplate string `mapstructure:"command_topic_template"`
+			MinCount             int           `mapstructure:"min_count"`
+			MaxCount             int           `mapstructure:"max_count"`
+			EventTopicTemplate   string        `mapstructure:"event_topic_template"`
+			CommandTopicTemplate string        `mapstructure:"command_topic_template"`
+			StatsInterval        time.Duration `mapstructure:"stats_interval"`
+			// StatsEnabled is nil when the key is omitted. ApplyDefaults treats that as enabled.
+			StatsEnabled *bool `mapstructure:"stats_enabled"`
 		} `mapstructure:"gateway"`
 	} `mapstructure:"simulator"`
 
@@ -77,3 +83,22 @@ type DeviceConfig struct {
 
 // C holds the global configuration.
 var C Config
+
+// ApplyDefaults fills simulator settings that are omitted from the config file.
+// An omitted device-profile region becomes AS923. Omitted gateway stats stay
+// enabled and use a 30s interval. stats_enabled=false disables publishing.
+// stats_interval of 0 uses 30s; disable stats with stats_enabled instead.
+func (c *Config) ApplyDefaults() {
+	for i := range c.Simulator {
+		if c.Simulator[i].Device.Region == "" {
+			c.Simulator[i].Device.Region = "AS923"
+		}
+		if c.Simulator[i].Gateway.StatsEnabled == nil {
+			enabled := true
+			c.Simulator[i].Gateway.StatsEnabled = &enabled
+		}
+		if c.Simulator[i].Gateway.StatsInterval <= 0 {
+			c.Simulator[i].Gateway.StatsInterval = 30 * time.Second
+		}
+	}
+}

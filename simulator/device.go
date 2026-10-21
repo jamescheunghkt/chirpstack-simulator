@@ -69,6 +69,9 @@ type Device struct {
 	// DevNonce.
 	devNonce lorawan.DevNonce
 
+	// Join attempts since the device was created. Used for retry logging.
+	joinAttempts uint32
+
 	// Uplink frame-counter.
 	fCntUp uint32
 
@@ -313,9 +316,17 @@ func (d *Device) downlinkLoop() {
 
 // joinRequest sends the join-request.
 func (d *Device) joinRequest() {
-	log.WithFields(log.Fields{
-		"dev_eui": d.devEUI,
-	}).Debug("simulator: send OTAA request")
+	d.joinAttempts++
+	fields := log.Fields{
+		"dev_eui":      d.devEUI,
+		"frequency_hz": d.uplinkTXInfo.Frequency,
+		"attempt":      d.joinAttempts,
+	}
+	if d.joinAttempts == 1 {
+		log.WithFields(fields).Info("simulator: send OTAA join-request")
+	} else {
+		log.WithFields(fields).Warn("simulator: join-accept not received, retrying join-request")
+	}
 
 	phy := lorawan.PHYPayload{
 		MHDR: lorawan.MHDR{
@@ -342,10 +353,13 @@ func (d *Device) joinRequest() {
 // dataUp sends an data uplink.
 func (d *Device) dataUp() {
 	log.WithFields(log.Fields{
-		"dev_eui":   d.devEUI,
-		"dev_addr":  d.devAddr,
-		"confirmed": d.confirmed,
-	}).Debug("simulator: send uplink data")
+		"dev_eui":      d.devEUI,
+		"dev_addr":     d.devAddr,
+		"confirmed":    d.confirmed,
+		"f_port":       d.fPort,
+		"f_cnt":        d.fCntUp,
+		"frequency_hz": d.uplinkTXInfo.Frequency,
+	}).Info("simulator: send uplink data")
 
 	mType := lorawan.UnconfirmedDataUp
 	if d.confirmed {
@@ -398,17 +412,13 @@ func (d *Device) joinAccept(phy lorawan.PHYPayload) error {
 		return errors.Wrap(err, "decrypt join-accept payload error")
 	}
 
+	// The gateway delivers every downlink to every device in range. A join-accept
+	// decrypts and passes this MIC check for only the device it was encrypted for.
 	ok, err := phy.ValidateDownlinkJoinMIC(lorawan.JoinRequestType, d.joinEUI, d.devNonce, d.appKey)
-	if err != nil {
+	if err != nil || !ok {
 		log.WithFields(log.Fields{
 			"dev_eui": d.devEUI,
-		}).Debug("simulator: invalid join-accept MIC")
-		return nil
-	}
-	if !ok {
-		log.WithFields(log.Fields{
-			"dev_eui": d.devEUI,
-		}).Debug("simulator: invalid join-accept MIC")
+		}).Debug("simulator: join-accept is not for this device")
 		return nil
 	}
 
