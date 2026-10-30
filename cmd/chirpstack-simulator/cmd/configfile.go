@@ -102,6 +102,9 @@ const configTemplate = `[general]
 #   # Number of devices to simulate.
 #   count=1000
 #
+#   # Join group size. Counts above this join one group at a time.
+#   group_size=100
+#
 #   # Uplink interval.
 #   uplink_interval="5m"
 #
@@ -149,6 +152,7 @@ activation_time="{{ $element.ActivationTime }}"
 
   [simulator.device]
   count={{ $element.Device.Count }}
+  group_size={{ $element.Device.GroupSize }}
   uplink_interval="{{ $element.Device.UplinkInterval }}"
   f_port="{{ $element.Device.FPort }}"
   payload="{{ $element.Device.Payload }}"

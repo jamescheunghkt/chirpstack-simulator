@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,6 +49,7 @@ func Start(ctx context.Context, wg *sync.WaitGroup, c config.Config) error {
 			wg:                   wg,
 			tenantID:             c.TenantID,
 			deviceCount:          c.Device.Count,
+			deviceGroupSize:      c.Device.GroupSize,
 			activationTime:       c.ActivationTime,
 			uplinkInterval:       c.Device.UplinkInterval,
 			fPort:                c.Device.FPort,
@@ -77,6 +79,7 @@ type simulation struct {
 	wg              *sync.WaitGroup
 	tenantID        string
 	deviceCount     int
+	deviceGroupSize int
 	gatewayMinCount int
 	gatewayMaxCount int
 	duration        time.Duration
@@ -241,7 +244,24 @@ func (s *simulation) runSimulation() error {
 	}
 	defer cancel()
 
-	for devEUI, appKey := range s.deviceAppKeys {
+	creds := s.deviceCredentials()
+	grouped, groupCount := deviceJoinGroups(len(creds), s.deviceGroupSize)
+	groupSize := normalizeGroupSize(s.deviceGroupSize)
+	var gates []*simulator.JoinGate
+	if grouped {
+		log.WithFields(log.Fields{
+			"devices":         len(creds),
+			"group_size":      groupSize,
+			"groups":          groupCount,
+			"activation_time": s.activationTime,
+		}).Info("simulator: joining devices one group at a time")
+		gates = make([]*simulator.JoinGate, groupCount)
+		for i := range gates {
+			gates[i] = simulator.NewJoinGate()
+		}
+	}
+
+	for i, cred := range creds {
 		devGateways := make(map[int]*simulator.Gateway)
 		devNumGateways := s.gatewayMinCount + mrand.Intn(s.gatewayMaxCount-s.gatewayMinCount+1)
 
@@ -256,11 +276,10 @@ func (s *simulation) runSimulation() error {
 			gws = append(gws, devGateways[k])
 		}
 
-		d, err := simulator.NewDevice(ctx, &wg,
-			simulator.WithDevEUI(devEUI),
-			simulator.WithAppKey(appKey),
+		opts := []simulator.DeviceOption{
+			simulator.WithDevEUI(cred.devEUI),
+			simulator.WithAppKey(cred.appKey),
 			simulator.WithUplinkInterval(s.uplinkInterval),
-			simulator.WithOTAADelay(time.Duration(mrand.Int63n(int64(s.activationTime)))),
 			simulator.WithUplinkPayload(false, s.fPort, s.payload),
 			simulator.WithGateways(gws),
 			simulator.WithUplinkTXInfo(gw.UplinkTxInfo{
@@ -275,12 +294,26 @@ func (s *simulation) runSimulation() error {
 					},
 				},
 			}),
-		)
+		}
+		if grouped {
+			opts = append(opts,
+				simulator.WithOTAADelay(joinGroupJitter(s.activationTime)),
+				simulator.WithJoinGate(gates[i/groupSize]),
+			)
+		} else if s.activationTime > 0 {
+			opts = append(opts, simulator.WithOTAADelay(time.Duration(mrand.Int63n(int64(s.activationTime)))))
+		}
+
+		d, err := simulator.NewDevice(ctx, &wg, opts...)
 		if err != nil {
 			return errors.Wrap(err, "new device error")
 		}
 
 		devices = append(devices, d)
+	}
+
+	if grouped {
+		go s.runJoinGroups(ctx, gates, devices)
 	}
 
 	go func() {
@@ -319,6 +352,10 @@ func (s *simulation) setupGateways() error {
 	log.Info("simulator: creating gateways")
 
 	for i := 0; i < s.gatewayMaxCount; i++ {
+		if err := s.pauseBeforeCreateBatch(i, s.gatewayMaxCount, "gateway"); err != nil {
+			return err
+		}
+
 		var gatewayID lorawan.EUI64
 		if _, err := rand.Read(gatewayID[:]); err != nil {
 			return errors.Wrap(err, "read random bytes error")
@@ -460,61 +497,129 @@ func (s *simulation) tearDownApplication() error {
 }
 
 func (s *simulation) setupDevices() error {
-	log.Info("simulator: init devices")
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < s.deviceCount; i++ {
-		wg.Add(1)
-
-		go func() {
-			var devEUI lorawan.EUI64
-			var appKey lorawan.AES128Key
-
-			if _, err := rand.Read(devEUI[:]); err != nil {
-				log.Fatal(err)
-			}
-			if _, err := rand.Read(appKey[:]); err != nil {
-				log.Fatal(err)
-			}
-
-			_, err := as.Device().Create(context.Background(), &api.CreateDeviceRequest{
-				Device: &api.Device{
-					DevEui:          devEUI.String(),
-					Name:            devEUI.String(),
-					Description:     devEUI.String(),
-					ApplicationId:   s.applicationID,
-					DeviceProfileId: s.deviceProfileID.String(),
-				},
-			})
-			if err != nil {
-				log.Fatalf("create device error, error: %s", err)
-			}
-
-			_, err = as.Device().CreateKeys(context.Background(), &api.CreateDeviceKeysRequest{
-				DeviceKeys: &api.DeviceKeys{
-					DevEui: devEUI.String(),
-
-					// yes, this is correct for LoRaWAN 1.0.x!
-					// see the API documentation
-					NwkKey: appKey.String(),
-				},
-			})
-			if err != nil {
-				log.Fatalf("create device keys error, error: %s", err)
-			}
-
-			s.deviceAppKeysMutex.Lock()
-			s.deviceAppKeys[devEUI] = appKey
-			s.deviceAppKeysMutex.Unlock()
-			wg.Done()
-		}()
-
+	sizes := createBatchSizes(s.deviceCount)
+	fields := log.Fields{
+		"count":       s.deviceCount,
+		"concurrency": deviceCreateConcurrency(s.deviceCount, s.deviceCount),
+	}
+	if s.deviceCount > createBatchThreshold {
+		fields["batch_size"] = createBatchSize
+		fields["pause"] = createBatchPause
+		log.WithFields(fields).Info("simulator: creating devices one at a time")
+	} else {
+		log.WithFields(fields).Info("simulator: init devices")
 	}
 
-	wg.Wait()
+	created := 0
+	for _, n := range sizes {
+		if err := s.pauseBeforeCreateBatch(created, s.deviceCount, "device"); err != nil {
+			return err
+		}
+		s.createDevices(n, created)
+		created += n
+	}
 
 	return nil
+}
+
+func (s *simulation) createDevices(n, already int) {
+	jobs := make(chan struct{})
+	var wg sync.WaitGroup
+	var finished int64
+	workers := deviceCreateConcurrency(s.deviceCount, n)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range jobs {
+				s.createOneDevice()
+				done := already + int(atomic.AddInt64(&finished, 1))
+				if done%100 == 0 || done == s.deviceCount {
+					log.WithFields(log.Fields{
+						"created": done,
+						"total":   s.deviceCount,
+					}).Info("simulator: created devices")
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < n; i++ {
+		jobs <- struct{}{}
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func (s *simulation) createOneDevice() {
+	var devEUI lorawan.EUI64
+	var appKey lorawan.AES128Key
+
+	if _, err := rand.Read(devEUI[:]); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := rand.Read(appKey[:]); err != nil {
+		log.Fatal(err)
+	}
+
+	createCtx, cancelCreate := context.WithTimeout(s.ctx, deviceCreateTimeout)
+	_, err := as.Device().Create(createCtx, &api.CreateDeviceRequest{
+		Device: &api.Device{
+			DevEui:          devEUI.String(),
+			Name:            devEUI.String(),
+			Description:     devEUI.String(),
+			ApplicationId:   s.applicationID,
+			DeviceProfileId: s.deviceProfileID.String(),
+		},
+	})
+	cancelCreate()
+	if err != nil {
+		log.Fatalf("create device error, error: %s", err)
+	}
+
+	keysCtx, cancelKeys := context.WithTimeout(s.ctx, deviceCreateTimeout)
+	_, err = as.Device().CreateKeys(keysCtx, &api.CreateDeviceKeysRequest{
+		DeviceKeys: &api.DeviceKeys{
+			DevEui: devEUI.String(),
+
+			// yes, this is correct for LoRaWAN 1.0.x!
+			// see the API documentation
+			NwkKey: appKey.String(),
+		},
+	})
+	cancelKeys()
+	if err != nil {
+		log.Fatalf("create device keys error, error: %s", err)
+	}
+
+	s.deviceAppKeysMutex.Lock()
+	s.deviceAppKeys[devEUI] = appKey
+	s.deviceAppKeysMutex.Unlock()
+}
+
+// pauseBeforeCreateBatch waits between batches once created is a positive
+// multiple of 1000 and more objects remain. Counts of 5000 or less do not pause.
+func (s *simulation) pauseBeforeCreateBatch(created, total int, kind string) error {
+	if !pauseBetweenCreates(created, total) {
+		return nil
+	}
+
+	log.WithFields(log.Fields{
+		"kind":    kind,
+		"created": created,
+		"total":   total,
+		"pause":   createBatchPause,
+	}).Info("simulator: pausing between create batches")
+
+	timer := time.NewTimer(createBatchPause)
+	defer timer.Stop()
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *simulation) tearDownDevices() error {

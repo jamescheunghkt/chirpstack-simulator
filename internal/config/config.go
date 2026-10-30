@@ -46,6 +46,7 @@ type Config struct {
 
 		Device struct {
 			Count           int           `mapstructure:"count"`
+			GroupSize       int           `mapstructure:"group_size"`
 			UplinkInterval  time.Duration `mapstructure:"uplink_interval"`
 			FPort           uint8         `mapstructure:"f_port"`
 			Payload         string        `mapstructure:"payload"`
@@ -85,13 +86,17 @@ type DeviceConfig struct {
 var C Config
 
 // ApplyDefaults fills simulator settings that are omitted from the config file.
-// An omitted device-profile region becomes AS923. Omitted gateway stats stay
-// enabled and use a 30s interval. stats_enabled=false disables publishing.
-// stats_interval of 0 uses 30s; disable stats with stats_enabled instead.
+// An omitted device-profile region becomes AS923. An omitted join group size
+// becomes 100. Omitted gateway stats stay enabled and use a 30s interval.
+// stats_enabled=false disables publishing. stats_interval of 0 uses 30s;
+// disable stats with stats_enabled instead.
 func (c *Config) ApplyDefaults() {
 	for i := range c.Simulator {
 		if c.Simulator[i].Device.Region == "" {
 			c.Simulator[i].Device.Region = "AS923"
+		}
+		if c.Simulator[i].Device.GroupSize <= 0 {
+			c.Simulator[i].Device.GroupSize = 100
 		}
 		if c.Simulator[i].Gateway.StatsEnabled == nil {
 			enabled := true

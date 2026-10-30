@@ -106,6 +106,13 @@ type Device struct {
 
 	// OTAA delay.
 	otaaDelay time.Duration
+
+	// joinGate pauses OTAA until this device's group is the active group.
+	// Nil keeps the original always-on join loop.
+	joinGate *JoinGate
+
+	activated     chan struct{}
+	activatedOnce sync.Once
 }
 
 // WithAppKey sets the AppKey.
@@ -138,6 +145,26 @@ func WithOTAADelay(delay time.Duration) DeviceOption {
 		d.otaaDelay = delay
 		return nil
 	}
+}
+
+// WithJoinGate holds OTAA join-requests until the gate is allowed.
+// The simulator uses one gate per device group so only one group joins at a time.
+func WithJoinGate(gate *JoinGate) DeviceOption {
+	return func(d *Device) error {
+		d.joinGate = gate
+		return nil
+	}
+}
+
+// Activated is closed after this device accepts a join-accept.
+func (d *Device) Activated() <-chan struct{} {
+	return d.activated
+}
+
+func (d *Device) markActivated() {
+	d.activatedOnce.Do(func() {
+		close(d.activated)
+	})
 }
 
 // WithUplinkInterval sets the uplink interval.
@@ -215,6 +242,7 @@ func NewDevice(ctx context.Context, wg *sync.WaitGroup, opts ...DeviceOption) (*
 
 		downlinkFrames: make(chan gw.DownlinkFrame, 100),
 		state:          deviceStateOTAA,
+		activated:      make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -247,13 +275,42 @@ func (d *Device) uplinkLoop() {
 		cancelled = true
 	}()
 
-	time.Sleep(d.otaaDelay)
+	// Grouped devices wait on the join gate and apply otaaDelay as in-group
+	// jitter after the group is allowed. Ungrouped devices keep the original
+	// stagger before the first join.
+	jitterPending := d.joinGate != nil && d.otaaDelay > 0
+	if d.joinGate == nil {
+		time.Sleep(d.otaaDelay)
+	}
 
 	for !cancelled {
 		switch d.getState() {
 		case deviceStateOTAA:
+			if d.joinGate != nil {
+				if !d.joinGate.Wait(d.ctx) {
+					return
+				}
+				if jitterPending {
+					jitterPending = false
+					if !d.joinGate.WaitInterval(d.ctx, d.otaaDelay) {
+						return
+					}
+					if !d.joinGate.IsOpen() {
+						continue
+					}
+				}
+				if d.getState() != deviceStateOTAA {
+					continue
+				}
+			}
 			d.joinRequest()
-			time.Sleep(6 * time.Second)
+			if d.joinGate != nil {
+				if !d.joinGate.WaitInterval(d.ctx, 6*time.Second) {
+					return
+				}
+			} else {
+				time.Sleep(6 * time.Second)
+			}
 		case deviceStateActivated:
 			d.dataUp()
 
@@ -445,6 +502,7 @@ func (d *Device) joinAccept(phy lorawan.PHYPayload) error {
 	}).Info("simulator: device OTAA activated")
 
 	d.setState(deviceStateActivated)
+	d.markActivated()
 	deviceJoinAcceptCounter().Inc()
 
 	return nil

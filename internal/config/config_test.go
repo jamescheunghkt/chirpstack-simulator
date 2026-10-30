@@ -34,12 +34,16 @@ event_topic_template="as923/gateway/{{ .GatewayID }}/event/{{ .Event }}"
 	if sim.Gateway.StatsInterval != 30*time.Second {
 		t.Fatalf("stats interval = %s, want 30s", sim.Gateway.StatsInterval)
 	}
+	if sim.Device.GroupSize != 100 {
+		t.Fatalf("omitted group size = %d, want 100", sim.Device.GroupSize)
+	}
 
 	explicit := loadConfig(t, `
 [[simulator]]
 [simulator.device]
 region="AS923_2"
 frequency=923200000
+group_size=250
 
 [simulator.gateway]
 stats_enabled=false
@@ -52,6 +56,9 @@ stats_interval="10s"
 	}
 	if got.Device.Region != "AS923_2" {
 		t.Fatalf("explicit region overridden to %q", got.Device.Region)
+	}
+	if got.Device.GroupSize != 250 {
+		t.Fatalf("explicit group size overridden to %d", got.Device.GroupSize)
 	}
 	if got.Gateway.StatsInterval != 10*time.Second {
 		t.Fatalf("explicit stats interval overridden to %s", got.Gateway.StatsInterval)
@@ -111,5 +118,11 @@ func TestRepositorySimulatorConfig(t *testing.T) {
 	}
 	if sim.Gateway.StatsInterval != 30*time.Second {
 		t.Fatalf("stats interval = %s, want 30s", sim.Gateway.StatsInterval)
+	}
+	if sim.Device.GroupSize != 100 {
+		t.Fatalf("group size = %d, want 100", sim.Device.GroupSize)
+	}
+	if sim.Device.Count <= sim.Device.GroupSize {
+		t.Fatalf("count = %d, group size = %d; grouped join is not exercised by this config", sim.Device.Count, sim.Device.GroupSize)
 	}
 }
